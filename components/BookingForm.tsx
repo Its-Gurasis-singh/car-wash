@@ -10,7 +10,7 @@ import {
   STATUS_LABELS,
   BOOKABLE_SERVICES,
   SURCHARGE_LABELS,
-  ENGINE_BAY_FEE,
+  engineBayFeeFor,
   OUT_OF_AREA_FEE,
   bookingTotal,
 } from '@/types/booking';
@@ -216,13 +216,19 @@ export default function BookingForm({
 
   // Changing the package fills in its list price, but never over a figure the
   // admin typed by hand - only over blank, or over the previous package's own
-  // list price. Editing an existing booking never touches the price.
+  // list price. Editing an existing booking never touches the price. The engine
+  // bay follows the same rule, since its standard rate depends on the package.
   const handleServiceChange = (next: ServiceType) => {
     const current = priceText.trim();
     const wasListPrice = current === '' || Number(current) === SERVICE_PRICES[service];
+    const engineBay = engineBayText.trim();
+    const wasStandardEngineBay = engineBay !== '' && Number(engineBay) === engineBayFeeFor(service);
     setService(next);
     if (!isEditing && wasListPrice && SERVICE_PRICES[next] != null) {
       setPriceText(String(SERVICE_PRICES[next]));
+    }
+    if (!isEditing && wasStandardEngineBay) {
+      setEngineBayText(String(engineBayFeeFor(next)));
     }
   };
 
@@ -730,8 +736,8 @@ export default function BookingForm({
             id="engine_bay_fee"
             icon={Wrench}
             label={SURCHARGE_LABELS.engine_bay}
-            hint={`Standard ${'$'}${ENGINE_BAY_FEE}`}
-            defaultAmount={ENGINE_BAY_FEE}
+            hint={`Standard ${'$'}${engineBayFeeFor(service)} with this package`}
+            defaultAmount={engineBayFeeFor(service)}
             value={engineBayText}
             onChange={setEngineBayText}
           />

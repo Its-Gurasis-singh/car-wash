@@ -93,7 +93,6 @@ export interface BookingStats {
 }
 
 /** Standard surcharges. Prefilled on the form; the stored amount is what counts. */
-export const ENGINE_BAY_FEE = 30;
 export const OUT_OF_AREA_FEE = 20;
 export const PET_HAIR_FEE = 25;
 /** Of which Absolute's share is $10; the detailer keeps $15. Mirrors sync_booking_fee(). */
@@ -110,6 +109,17 @@ export const SERVICE_PRICES: Partial<Record<ServiceType, number>> = {
   interior_titanium: 170,
   full_titanium: 200,
 };
+
+/**
+ * Standard engine bay price per vehicle, which depends on the package: cheapest
+ * with Titanium Full (the upsell), dearest with an interior-only job. Same rates
+ * the Instagram chatbot quotes.
+ */
+export function engineBayFeeFor(service: ServiceType): number {
+  if (service.startsWith('interior')) return 60;
+  if (service === 'full_titanium') return 30;
+  return 50;
+}
 
 export const SURCHARGE_LABELS = {
   engine_bay: 'Engine bay',
