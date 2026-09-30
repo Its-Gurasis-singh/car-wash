@@ -94,6 +94,11 @@ export interface BookingStats {
 
 /** Standard surcharges. Prefilled on the form; the stored amount is what counts. */
 export const OUT_OF_AREA_FEE = 20;
+/**
+ * Per 7-seater vehicle, any package. Folded into `price` (like pet hair), with
+ * "7-seater +$30" in the notes - the chatbot and website both do it that way.
+ */
+export const SEVEN_SEATER_FEE = 30;
 export const PET_HAIR_FEE = 25;
 /** Of which Absolute's share is $10; the detailer keeps $15. Mirrors sync_booking_fee(). */
 export const PET_HAIR_FEE_TO_ABSOLUTE = 10;

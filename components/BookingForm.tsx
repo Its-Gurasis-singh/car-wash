@@ -12,6 +12,7 @@ import {
   SURCHARGE_LABELS,
   engineBayFeeFor,
   OUT_OF_AREA_FEE,
+  SEVEN_SEATER_FEE,
   bookingTotal,
 } from '@/types/booking';
 import { formatMoney } from '@/types/expense';
@@ -717,7 +718,8 @@ export default function BookingForm({
               </p>
             ) : (
               <p className="mt-1 text-[11px] text-charcoal-muted">
-                Base price for all vehicles, before any extras below.
+                Base price for all vehicles, before any extras below. Add{' '}
+                {'$'}{SEVEN_SEATER_FEE} for each 7-seater and note it.
               </p>
             )}
           </div>
