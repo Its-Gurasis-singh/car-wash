@@ -1,7 +1,7 @@
 'use client';
 
 import React, { useState, useEffect, useCallback, useMemo } from 'react';
-import { Booking, bookingTotal } from '@/types/booking';
+import { Booking } from '@/types/booking';
 import { Expense, EXPENSE_TYPE_LABELS, formatMoney } from '@/types/expense';
 import { getBookings, subscribeToBookings } from '@/lib/bookings';
 import {
@@ -171,94 +171,59 @@ export default function FinancePage() {
   }, [loadData]);
 
   /**
-   * Revenue counts COMPLETED bookings only — money actually earned. Scheduled
-   * work is pipeline, and cancelled bookings still carry a price, so including
-   * either would inflate profit against real expenses.
+   * Absolute's revenue is commission: what detailers owe on each job (an admin
+   * override if there is one), counted on the day it was earned - the same
+   * figure as "Commission earned" in the commission panel below. No-show fees
+   * are commission too. Jobs completed before the commission model have no
+   * commission and count $0; they are shown as a count, never as revenue. A
+   * "Fee not set" job also counts $0 until it is resolved, and is flagged in
+   * the commission panel.
    */
-  // bookingTotal, not price: a job's revenue includes the engine bay and
-  // out-of-area surcharges, which are stored separately from the base price.
-  const earned = useMemo(
-    () => bookings.filter((b) => b.status === 'completed' && bookingTotal(b) != null),
-    [bookings]
-  );
+  const commissionRows = useMemo(() => fees.filter((f) => f.effective_amount != null), [fees]);
 
   /** Oldest date in the data, so All time starts where the records start. */
   const earliest = useMemo(() => {
     let oldest = todayIso();
-    earned.forEach((b) => {
-      if (b.booking_date < oldest) oldest = b.booking_date;
+    commissionRows.forEach((f) => {
+      if (f.completed_on < oldest) oldest = f.completed_on;
     });
     expenses.forEach((e) => {
       if (e.date < oldest) oldest = e.date;
     });
     return oldest;
-  }, [earned, expenses]);
+  }, [commissionRows, expenses]);
 
   const bounds = useMemo(() => rangeBounds(range, earliest), [range, earliest]);
 
-  const earnedInRange = useMemo(
-    () => earned.filter((b) => b.booking_date >= bounds.start && b.booking_date <= bounds.end),
-    [earned, bounds]
+  const commissionInRange = useMemo(
+    () => commissionRows.filter((f) => f.completed_on >= bounds.start && f.completed_on <= bounds.end),
+    [commissionRows, bounds]
   );
 
-  const feeByBooking = useMemo(() => {
-    const m = new Map<string, BookingFee>();
-    fees.forEach((f) => m.set(f.booking_id, f));
-    return m;
-  }, [fees]);
-
-  /**
-   * What the business actually earned on a job. Under the current model the
-   * detailer collects the full amount and owes a commission, so the commission
-   * (an admin override if there is one) is the revenue and the rest never
-   * touches the business. A job with no commission row was completed under the
-   * old model, when the business collected the whole amount itself - so its
-   * gross is still the right figure. A "Fee not set" job counts $0 here and is
-   * flagged in the commission panel.
-   */
-  const revenueOf = useCallback(
-    (b: Booking): number => {
-      const fee = feeByBooking.get(b.id);
-      return fee ? fee.effective_amount ?? 0 : bookingTotal(b) || 0;
-    },
-    [feeByBooking]
-  );
-
-  /**
-   * Commission charged on a job that was not completed - a no-show fee. The
-   * completed-jobs list does not include it, so it is added on its own, dated
-   * to the day it was charged for.
-   */
-  const noShowFeesInRange = useMemo(() => {
-    const status = new Map(bookings.map((b) => [b.id, b.status]));
-    return fees.filter(
-      (f) =>
-        !!f.effective_amount &&
-        status.get(f.booking_id) !== 'completed' &&
-        f.completed_on >= bounds.start &&
-        f.completed_on <= bounds.end
+  /** Completed jobs in the range with no commission row: done before the model. */
+  const legacyInRange = useMemo(() => {
+    const charged = new Set(fees.map((f) => f.booking_id));
+    return bookings.filter(
+      (b) => b.status === 'completed' && !charged.has(b.id) && b.booking_date >= bounds.start && b.booking_date <= bounds.end
     );
-  }, [fees, bookings, bounds]);
+  }, [bookings, fees, bounds]);
 
   /**
-   * The money flow for the range. Every completed job is one of two kinds:
-   * a fee-model job, where the detailer collected the gross and Absolute's
-   * revenue is the fee; or a pre-model job, where the business collected the
-   * gross itself. Revenue is the sum of the two, and this is where the split
-   * is made visible rather than buried.
+   * The money flow for the range: what customers paid on commissioned jobs,
+   * less what the detailers kept, is Absolute's commission. Plus any no-show
+   * fees, which have no job value behind them.
    */
   const feeStats = useMemo(() => {
     const today = torontoToday();
-    let feeJobs = 0, feeGross = 0, feeRevenue = 0, legacyJobs = 0, legacyGross = 0;
-    earnedInRange.forEach((b) => {
-      const fee = feeByBooking.get(b.id);
-      if (fee) {
-        feeJobs += 1;
-        feeGross += fee.customer_total;
-        feeRevenue += fee.effective_amount ?? 0;
+    let jobs = 0, gross = 0, jobCommission = 0, otherFees = 0, otherCount = 0;
+    commissionInRange.forEach((f) => {
+      if (f.completed_at) {
+        jobs += 1;
+        gross += f.customer_total;
+        jobCommission += f.effective_amount ?? 0;
       } else {
-        legacyJobs += 1;
-        legacyGross += bookingTotal(b) || 0;
+        otherCount += 1;
+        otherFees += f.effective_amount ?? 0;
       }
     });
     // Outstanding comes from the payments ledger: every commission charged,
@@ -272,20 +237,19 @@ export default function FinancePage() {
       owedAllTime += Math.max(0, charged - paid);
       overdueAllTime += overdueFor(id, fees, payments, today);
     }
-    const noShowFees = noShowFeesInRange.reduce((s, f) => s + (f.effective_amount ?? 0), 0);
     return {
-      feeJobs,
-      feeGross,
-      feeRevenue: feeRevenue + noShowFees,
-      noShowFees,
-      detailerShare: feeGross - feeRevenue,
-      legacyJobs,
-      legacyGross,
-      bookingsValue: feeGross + legacyGross,
+      jobs,
+      gross,
+      jobCommission,
+      otherFees,
+      otherCount,
+      revenue: jobCommission + otherFees,
+      detailerShare: gross - jobCommission,
+      legacyJobs: legacyInRange.length,
       owedAllTime,
       overdueAllTime,
     };
-  }, [fees, payments, earnedInRange, feeByBooking, noShowFeesInRange]);
+  }, [fees, payments, commissionInRange, legacyInRange]);
 
   /**
    * Recurring expenses are expanded into the individual costs that landed in
@@ -314,14 +278,9 @@ export default function FinancePage() {
       return map.get(key)!;
     };
 
-    earnedInRange.forEach((b) => {
-      const row = ensure(periodKey(b.booking_date, bounds.granularity));
-      const amount = revenueOf(b);
-      if ((b.service_location || 'mobile') === 'shop') row.revenueShop += amount;
-      else row.revenueMobile += amount;
-    });
-
-    noShowFeesInRange.forEach((f) => {
+    // Every job is mobile since the shop channel closed, so commission all
+    // lands in the mobile column.
+    commissionInRange.forEach((f) => {
       ensure(periodKey(f.completed_on, bounds.granularity)).revenueMobile += f.effective_amount ?? 0;
     });
 
@@ -335,7 +294,7 @@ export default function FinancePage() {
     // No slice: the range itself decides the window now, so the chart shows the
     // whole of what the headline cards are counting and the two cannot disagree.
     return Array.from(map.values()).sort((a, b) => a.key.localeCompare(b.key));
-  }, [earnedInRange, noShowFeesInRange, occurrences, bounds, revenueOf]);
+  }, [commissionInRange, occurrences, bounds]);
 
   const totals = useMemo(() => {
     const t = {
@@ -432,12 +391,16 @@ export default function FinancePage() {
     {
       title: 'Absolute revenue',
       value: formatMoney(revenueTotal),
-      note:
-        feeStats.feeJobs > 0 && feeStats.legacyJobs > 0
-          ? `${formatMoney(feeStats.feeRevenue)} commission on ${feeStats.feeJobs} job${feeStats.feeJobs === 1 ? '' : 's'} + ${formatMoney(feeStats.legacyGross)} gross on ${feeStats.legacyJobs} pre-commission job${feeStats.legacyJobs === 1 ? '' : 's'}`
-          : feeStats.feeJobs > 0 || feeStats.noShowFees > 0
-            ? `Commission on ${feeStats.feeJobs} completed job${feeStats.feeJobs === 1 ? '' : 's'}${feeStats.noShowFees > 0 ? ` + ${formatMoney(feeStats.noShowFees)} no-show fees` : ''} · ${rangeNote}`
-            : `Completed jobs · ${rangeNote}`,
+      // Commission only. Jobs from before the commission model are named so a
+      // quiet early range does not look like missing data.
+      note: [
+        `Commission on ${feeStats.jobs} job${feeStats.jobs === 1 ? '' : 's'}`,
+        feeStats.otherFees > 0 ? `+ ${formatMoney(feeStats.otherFees)} no-show fees` : '',
+        feeStats.legacyJobs > 0 ? `(${feeStats.legacyJobs} pre-commission job${feeStats.legacyJobs === 1 ? '' : 's'} not counted)` : '',
+        `· ${rangeNote}`,
+      ]
+        .filter(Boolean)
+        .join(' '),
       icon: Wallet,
     },
     {
@@ -458,7 +421,7 @@ export default function FinancePage() {
     {
       title: 'Profit',
       value: formatMoney(profitTotal),
-      note: `Revenue minus all expenses · ${rangeNote}`,
+      note: `Commission minus all expenses · ${rangeNote}`,
       icon: TrendingUp,
     },
   ];
@@ -476,7 +439,7 @@ export default function FinancePage() {
             </span>
           </div>
           <p className="text-xs sm:text-sm text-charcoal-muted mt-0.5 sm:mt-1">
-            Revenue counts completed jobs only. Expenses are entered manually.
+            Revenue is the commission detailers owe Absolute. Expenses are entered manually.
           </p>
         </div>
 
@@ -574,21 +537,21 @@ export default function FinancePage() {
         <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 items-stretch">
           <div className="rounded-xl border border-charcoal-border/60 bg-canvas p-3">
             <p className="text-[11px] font-semibold uppercase tracking-wider text-charcoal-muted">Gross job value</p>
-            <p className="mt-1 text-xl font-bold tabular-nums text-charcoal">{formatMoney(feeStats.bookingsValue)}</p>
-            <p className="text-[11px] text-charcoal-muted">What customers paid for completed jobs, {rangeNote}. Detailers collect it.</p>
+            <p className="mt-1 text-xl font-bold tabular-nums text-charcoal">{formatMoney(feeStats.gross)}</p>
+            <p className="text-[11px] text-charcoal-muted">What customers paid for commissioned jobs, {rangeNote}. Detailers collect it.</p>
           </div>
           <div className="rounded-xl border border-charcoal-border/60 bg-canvas p-3">
             <p className="text-[11px] font-semibold uppercase tracking-wider text-charcoal-muted">Detailers kept</p>
             <p className="mt-1 text-xl font-bold tabular-nums text-charcoal">−{formatMoney(feeStats.detailerShare)}</p>
-            <p className="text-[11px] text-charcoal-muted">Their share on {feeStats.feeJobs} fee-model job{feeStats.feeJobs === 1 ? '' : 's'}</p>
+            <p className="text-[11px] text-charcoal-muted">Their share on {feeStats.jobs} job{feeStats.jobs === 1 ? '' : 's'}</p>
           </div>
           <div className="rounded-xl border border-sage-300/70 bg-sage-50/60 p-3">
             <p className="text-[11px] font-semibold uppercase tracking-wider text-sage-800">Absolute revenue</p>
             <p className="mt-1 text-xl font-bold tabular-nums text-sage-900">{formatMoney(revenueTotal)}</p>
             <p className="text-[11px] text-sage-800/80">
-              {feeStats.legacyJobs > 0
-                ? `Commission ${formatMoney(feeStats.feeRevenue)} + pre-commission gross ${formatMoney(feeStats.legacyGross)}`
-                : 'Absolute commission revenue only'}
+              {feeStats.otherFees > 0
+                ? `Commission ${formatMoney(feeStats.jobCommission)} + no-show fees ${formatMoney(feeStats.otherFees)}`
+                : 'Absolute commission revenue'}
             </p>
           </div>
         </div>
