@@ -66,6 +66,10 @@ function decodeBookingFromDb(row: any): Booking {
     has_power: Boolean(row.has_power),
     has_water: Boolean(row.has_water),
     status: row.status,
+    pet_hair: Boolean(row.pet_hair),
+    notes: row.notes ?? null,
+    created_at: row.created_at ?? undefined,
+    completed_at: row.completed_at ?? null,
   };
 }
 

@@ -14,14 +14,15 @@ import {
   ExpenseInput,
 } from '@/lib/expenses';
 import { expandExpenses, todayIso } from '@/lib/expenseOccurrences';
-import { BookingFee } from '@/types/fee';
-import { getFees, markWeekPaid, markWeekOwed } from '@/lib/fees';
+import { BookingFee, DetailerPayment } from '@/types/fee';
+import { getFees, getPayments, subscribeToLedger } from '@/lib/fees';
+import { overdueFor } from '@/lib/commissionStats';
+import { torontoToday } from '@/lib/weeks';
 import { Detailer } from '@/types/detailer';
 import { getDetailers } from '@/lib/detailers';
-import DetailerEarnings from '@/components/DetailerEarnings';
 import { useAuth } from '@/components/AuthProvider';
 import ExpenseManager from '@/components/ExpenseManager';
-import FeeManager from '@/components/FeeManager';
+import CommissionPanel from '@/components/finance/CommissionPanel';
 import {
   Wallet,
   HandCoins,
@@ -134,6 +135,7 @@ export default function FinancePage() {
   const [bookings, setBookings] = useState<Booking[]>([]);
   const [expenses, setExpenses] = useState<Expense[]>([]);
   const [fees, setFees] = useState<BookingFee[]>([]);
+  const [payments, setPayments] = useState<DetailerPayment[]>([]);
   const [detailers, setDetailers] = useState<Detailer[]>([]);
   const [range, setRange] = useState<Range>('this_month');
   const [isLoading, setIsLoading] = useState(true);
@@ -142,10 +144,11 @@ export default function FinancePage() {
   const loadData = useCallback(async () => {
     try {
       setError(null);
-      const [b, e, f, d] = await Promise.all([getBookings(), getExpenses(), getFees(), getDetailers()]);
+      const [b, e, f, p, d] = await Promise.all([getBookings(), getExpenses(), getFees(), getPayments(), getDetailers()]);
       setBookings(b);
       setExpenses(e);
       setFees(f);
+      setPayments(p);
       setDetailers(d);
     } catch (err: any) {
       console.error('[FinancePage loadData error]:', err);
@@ -159,9 +162,11 @@ export default function FinancePage() {
     loadData();
     const unsubBookings = subscribeToBookings(() => loadData());
     const unsubExpenses = subscribeToExpenses(() => loadData());
+    const unsubLedger = subscribeToLedger(() => loadData());
     return () => {
       unsubBookings();
       unsubExpenses();
+      unsubLedger();
     };
   }, [loadData]);
 
@@ -204,18 +209,36 @@ export default function FinancePage() {
 
   /**
    * What the business actually earned on a job. Under the current model the
-   * detailer collects the full amount and owes a fixed booking fee, so the fee
-   * is the revenue and the rest never touches the business. A job with no fee
-   * row was completed under the old model, when the business collected the
-   * whole amount itself - so its gross is still the right figure.
+   * detailer collects the full amount and owes a commission, so the commission
+   * (an admin override if there is one) is the revenue and the rest never
+   * touches the business. A job with no commission row was completed under the
+   * old model, when the business collected the whole amount itself - so its
+   * gross is still the right figure. A "Fee not set" job counts $0 here and is
+   * flagged in the commission panel.
    */
   const revenueOf = useCallback(
     (b: Booking): number => {
       const fee = feeByBooking.get(b.id);
-      return fee ? fee.fee_amount : bookingTotal(b) || 0;
+      return fee ? fee.effective_amount ?? 0 : bookingTotal(b) || 0;
     },
     [feeByBooking]
   );
+
+  /**
+   * Commission charged on a job that was not completed - a no-show fee. The
+   * completed-jobs list does not include it, so it is added on its own, dated
+   * to the day it was charged for.
+   */
+  const noShowFeesInRange = useMemo(() => {
+    const status = new Map(bookings.map((b) => [b.id, b.status]));
+    return fees.filter(
+      (f) =>
+        !!f.effective_amount &&
+        status.get(f.booking_id) !== 'completed' &&
+        f.completed_on >= bounds.start &&
+        f.completed_on <= bounds.end
+    );
+  }, [fees, bookings, bounds]);
 
   /**
    * The money flow for the range. Every completed job is one of two kinds:
@@ -225,32 +248,44 @@ export default function FinancePage() {
    * is made visible rather than buried.
    */
   const feeStats = useMemo(() => {
-    const today = todayIso();
+    const today = torontoToday();
     let feeJobs = 0, feeGross = 0, feeRevenue = 0, legacyJobs = 0, legacyGross = 0;
     earnedInRange.forEach((b) => {
       const fee = feeByBooking.get(b.id);
       if (fee) {
         feeJobs += 1;
         feeGross += fee.customer_total;
-        feeRevenue += fee.fee_amount;
+        feeRevenue += fee.effective_amount ?? 0;
       } else {
         legacyJobs += 1;
         legacyGross += bookingTotal(b) || 0;
       }
     });
-    const owedRows = fees.filter((f) => f.status === 'owed');
+    // Outstanding comes from the payments ledger: every commission charged,
+    // less every payment, per detailer. A detailer in credit does not reduce
+    // what the others owe.
+    let owedAllTime = 0;
+    let overdueAllTime = 0;
+    for (const id of Array.from(new Set(fees.map((f) => f.detailer_id)))) {
+      const charged = fees.filter((f) => f.detailer_id === id).reduce((s, f) => s + (f.effective_amount ?? 0), 0);
+      const paid = payments.filter((p) => p.detailer_id === id).reduce((s, p) => s + p.amount, 0);
+      owedAllTime += Math.max(0, charged - paid);
+      overdueAllTime += overdueFor(id, fees, payments, today);
+    }
+    const noShowFees = noShowFeesInRange.reduce((s, f) => s + (f.effective_amount ?? 0), 0);
     return {
       feeJobs,
       feeGross,
-      feeRevenue,
+      feeRevenue: feeRevenue + noShowFees,
+      noShowFees,
       detailerShare: feeGross - feeRevenue,
       legacyJobs,
       legacyGross,
       bookingsValue: feeGross + legacyGross,
-      owedAllTime: owedRows.reduce((sum, f) => sum + f.fee_amount, 0),
-      overdueAllTime: owedRows.filter((f) => f.due_on < today).reduce((sum, f) => sum + f.fee_amount, 0),
+      owedAllTime,
+      overdueAllTime,
     };
-  }, [fees, earnedInRange, feeByBooking]);
+  }, [fees, payments, earnedInRange, feeByBooking, noShowFeesInRange]);
 
   /**
    * Recurring expenses are expanded into the individual costs that landed in
@@ -286,6 +321,10 @@ export default function FinancePage() {
       else row.revenueMobile += amount;
     });
 
+    noShowFeesInRange.forEach((f) => {
+      ensure(periodKey(f.completed_on, bounds.granularity)).revenueMobile += f.effective_amount ?? 0;
+    });
+
     occurrences.forEach((o) => {
       const row = ensure(periodKey(o.date, bounds.granularity));
       if (o.expense.service_location === 'shop') row.expenseShop += o.amount;
@@ -296,7 +335,7 @@ export default function FinancePage() {
     // No slice: the range itself decides the window now, so the chart shows the
     // whole of what the headline cards are counting and the two cannot disagree.
     return Array.from(map.values()).sort((a, b) => a.key.localeCompare(b.key));
-  }, [earnedInRange, occurrences, bounds, revenueOf]);
+  }, [earnedInRange, noShowFeesInRange, occurrences, bounds, revenueOf]);
 
   const totals = useMemo(() => {
     const t = {
@@ -360,25 +399,11 @@ export default function FinancePage() {
 
   const categories = useMemo(() => existingCategories(expenses), [expenses]);
 
-  const handleMarkWeekPaid = async (detailerId: string, weekStart: string) => {
-    try {
-      setError(null);
-      await markWeekPaid(detailerId, weekStart);
-      setFees(await getFees());
-    } catch (err: any) {
-      setError(err?.message || 'Could not mark that week paid.');
-    }
-  };
-
-  const handleMarkWeekOwed = async (detailerId: string, weekStart: string) => {
-    try {
-      setError(null);
-      await markWeekOwed(detailerId, weekStart);
-      setFees(await getFees());
-    } catch (err: any) {
-      setError(err?.message || 'Could not reopen that week.');
-    }
-  };
+  const reloadLedger = useCallback(async () => {
+    const [f, p] = await Promise.all([getFees(), getPayments()]);
+    setFees(f);
+    setPayments(p);
+  }, []);
 
   const handleAdd = async (data: ExpenseInput) => {
     const created = await addExpense(data);
@@ -409,19 +434,19 @@ export default function FinancePage() {
       value: formatMoney(revenueTotal),
       note:
         feeStats.feeJobs > 0 && feeStats.legacyJobs > 0
-          ? `${formatMoney(feeStats.feeRevenue)} in fees on ${feeStats.feeJobs} job${feeStats.feeJobs === 1 ? '' : 's'} + ${formatMoney(feeStats.legacyGross)} on ${feeStats.legacyJobs} pre-fee job${feeStats.legacyJobs === 1 ? '' : 's'}`
-          : feeStats.feeJobs > 0
-            ? `Booking fees on ${feeStats.feeJobs} completed job${feeStats.feeJobs === 1 ? '' : 's'} · ${rangeNote}`
+          ? `${formatMoney(feeStats.feeRevenue)} commission on ${feeStats.feeJobs} job${feeStats.feeJobs === 1 ? '' : 's'} + ${formatMoney(feeStats.legacyGross)} gross on ${feeStats.legacyJobs} pre-commission job${feeStats.legacyJobs === 1 ? '' : 's'}`
+          : feeStats.feeJobs > 0 || feeStats.noShowFees > 0
+            ? `Commission on ${feeStats.feeJobs} completed job${feeStats.feeJobs === 1 ? '' : 's'}${feeStats.noShowFees > 0 ? ` + ${formatMoney(feeStats.noShowFees)} no-show fees` : ''} · ${rangeNote}`
             : `Completed jobs · ${rangeNote}`,
       icon: Wallet,
     },
     {
-      title: 'Fees outstanding',
+      title: 'Commission outstanding',
       value: formatMoney(feeStats.owedAllTime),
       note:
         feeStats.overdueAllTime > 0
           ? `${formatMoney(feeStats.overdueAllTime)} overdue · owed by detailers, all weeks`
-          : 'Owed by detailers, all weeks',
+          : 'Owed by detailers, all weeks, after payments',
       icon: HandCoins,
     },
     {
@@ -548,9 +573,9 @@ export default function FinancePage() {
       >
         <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 items-stretch">
           <div className="rounded-xl border border-charcoal-border/60 bg-canvas p-3">
-            <p className="text-[11px] font-semibold uppercase tracking-wider text-charcoal-muted">Bookings value</p>
+            <p className="text-[11px] font-semibold uppercase tracking-wider text-charcoal-muted">Gross job value</p>
             <p className="mt-1 text-xl font-bold tabular-nums text-charcoal">{formatMoney(feeStats.bookingsValue)}</p>
-            <p className="text-[11px] text-charcoal-muted">What customers paid, {rangeNote}</p>
+            <p className="text-[11px] text-charcoal-muted">What customers paid for completed jobs, {rangeNote}. Detailers collect it.</p>
           </div>
           <div className="rounded-xl border border-charcoal-border/60 bg-canvas p-3">
             <p className="text-[11px] font-semibold uppercase tracking-wider text-charcoal-muted">Detailers kept</p>
@@ -562,8 +587,8 @@ export default function FinancePage() {
             <p className="mt-1 text-xl font-bold tabular-nums text-sage-900">{formatMoney(revenueTotal)}</p>
             <p className="text-[11px] text-sage-800/80">
               {feeStats.legacyJobs > 0
-                ? `Fees ${formatMoney(feeStats.feeRevenue)} + pre-fee gross ${formatMoney(feeStats.legacyGross)}`
-                : 'Booking fees only'}
+                ? `Commission ${formatMoney(feeStats.feeRevenue)} + pre-commission gross ${formatMoney(feeStats.legacyGross)}`
+                : 'Absolute commission revenue only'}
             </p>
           </div>
         </div>
@@ -717,11 +742,10 @@ export default function FinancePage() {
         )}
       </section>
 
-      {/* Booking fees: the business's revenue on every job done under the
-          current model, and the record of which weeks have been settled. */}
-      <DetailerEarnings completedInRange={earnedInRange} fees={fees} detailers={detailers} rangeLabel={RANGE_LABELS[range]} />
-
-      <FeeManager fees={fees} onMarkPaid={handleMarkWeekPaid} onMarkOwed={handleMarkWeekOwed} />
+      {/* Weekly commission: per detailer and per Mon-Sun week, what was booked,
+          completed, earned, paid and is still owed. Has its own week selector;
+          the range buttons at the top do not apply to it. */}
+      <CommissionPanel bookings={bookings} fees={fees} payments={payments} detailers={detailers} onChanged={reloadLedger} />
 
       {/* Manual expense entry */}
       <ExpenseManager

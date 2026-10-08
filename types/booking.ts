@@ -83,6 +83,13 @@ export interface Booking {
   has_power: boolean;
   has_water: boolean;
   status: BookingStatus;
+  /** One flag per booking, not per vehicle. */
+  pet_hair?: boolean;
+  notes?: string | null;
+  /** When the booking was made. "New bookings" counts by this. */
+  created_at?: string;
+  /** Set by the database when the booking becomes completed; cleared if it stops being. */
+  completed_at?: string | null;
 }
 
 export interface BookingStats {
